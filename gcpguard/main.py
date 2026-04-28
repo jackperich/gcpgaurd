@@ -1,48 +1,442 @@
 import base64
 import json
 import functions_framework
-from google.cloud import logging as cloud_logging
+from datetime import datetime
 
-# Initialize Cloud Logging client
-logging_client = cloud_logging.Client()
-logger = logging_client.logger("gcpguard")
+from google.cloud import storage
+from google.cloud import compute_v1
+from google.cloud import resourcemanager_v3
+import google.auth
+from google.api_core import exceptions
 
+
+# ENTRY POINT — Triggered by Pub/Sub via Eventarc from SCC
 
 @functions_framework.cloud_event
-def remediate(cloud_event):
+def process_security_finding(cloud_event):
     """
-    Cloud Function entry point.
-    Triggered by a Pub/Sub message from SCC findings.
-    Logs the finding to Cloud Logging.
+    Main entry point for GCP Guard Cloud Function.
+    Processes security findings from Security Command Center and routes them
+    to appropriate remediation handlers.
     """
     try:
-        # Decode the Pub/Sub message
-        pubsub_message = cloud_event.data["message"]
-        message_data = base64.b64decode(pubsub_message["data"]).decode("utf-8")
-        finding = json.loads(message_data)
-
-        # Extract key fields from the SCC finding
+        # ── Extract and parse the Pub/Sub message ──────────────────────────
+        if hasattr(cloud_event, 'data') and 'message' in cloud_event.data:
+            pubsub_message = cloud_event.data["message"]
+            
+            if 'data' in pubsub_message:
+                message_data = base64.b64decode(pubsub_message["data"]).decode("utf-8")
+                finding = json.loads(message_data)
+            else:
+                finding = pubsub_message
+        else:
+            finding = cloud_event.data if hasattr(cloud_event, 'data') else {}
+        
+        # ── Extract finding information ────────────────────────────────────
         finding_info = finding.get("finding", {})
-        finding_name = finding_info.get("name", "unknown")
-        category = finding_info.get("category", "unknown")
-        severity = finding_info.get("severity", "unknown")
-        resource_name = finding_info.get("resourceName", "unknown")
-        state = finding_info.get("state", "unknown")
+        notification_config = finding.get("notificationConfigName", "unknown")
+        
+        category = finding_info.get("category", "UNKNOWN")
+        severity = finding_info.get("severity", "UNKNOWN")
+        state = finding_info.get("state", "UNKNOWN")
+        resource_name = finding_info.get("resourceName", "UNKNOWN")
+        finding_name = finding_info.get("name", "UNKNOWN")
+        
+        # ── Log the finding ────────────────────────────────────────────────
+        print("[GCP GUARD] New Security Finding Received")
+        print(f"Timestamp: {datetime.utcnow().isoformat()}Z")
+        print(f"Category: {category}")
+        print(f"Severity: {severity}")
+        print(f"State: {state}")
+        print(f"Resource: {resource_name}")
+        print(f"Finding: {finding_name}")
+        print(f"Config: {notification_config}")
+        
+        # ── Route to remediation handler ───────────────────────────────────
+        result = route_to_handler(finding_info)
+        
+        print(f"[GCP GUARD] Remediation Result: {result}")
+        
+        return result
+        
+    except Exception as e:
+        print(f"[GCP GUARD ERROR] Failed to process finding: {str(e)}")
+        print(f"CloudEvent data: {cloud_event.data if hasattr(cloud_event, 'data') else 'N/A'}")
+        import traceback
+        traceback.print_exc()
+        return {"status": "error", "message": str(e)}
 
-        # Log the finding to Cloud Logging
-        log_entry = {
-            "message": "GCPGuard SCC Finding Received",
-            "finding_name": finding_name,
+
+# ROUTING LOGIC
+
+def route_to_handler(finding_info):
+    """
+    Routes a finding to the appropriate remediation handler based on category.
+    Returns a dict with status and message.
+    """
+    category = finding_info.get("category", "")
+    resource_name = finding_info.get("resourceName", "")
+    
+    print(f"[GCP GUARD] Routing finding: category={category}")
+    
+    # Map SCC categories to handler functions
+    handlers = {
+        # Public bucket findings
+        "PUBLIC_BUCKET_ACL": handle_public_bucket,
+        "PUBLIC_BUCKET_IAM": handle_public_bucket,
+        "BUCKET_POLICY_ONLY_DISABLED": handle_public_bucket,
+        
+        # IAM findings
+        "ADMIN_SERVICE_ACCOUNT": handle_overly_permissive_iam,
+        "KMS_ROLE_SEPARATION": handle_overly_permissive_iam,
+        
+        # Firewall findings
+        "OPEN_FIREWALL": handle_open_firewall,
+        "FIREWALL_OPEN_TO_WORLD": handle_open_firewall,
+        "OPEN_SSH_PORT": handle_open_firewall,
+        "OPEN_RDP_PORT": handle_open_firewall,
+        
+        # Disk encryption findings
+        "DISK_CMEK_DISABLED": handle_unencrypted_disk,
+        
+        # Public IP findings
+        "PUBLIC_IP_ADDRESS": handle_public_ip,
+    }
+    
+    handler = handlers.get(category)
+    
+    if handler:
+        return handler(finding_info)
+    else:
+        print(f"[GCP GUARD] No handler configured for category: {category}")
+        return {
+            "status": "unsupported",
             "category": category,
-            "severity": severity,
-            "resource_name": resource_name,
-            "state": state,
+            "message": f"No remediation handler for {category}"
         }
 
-        logger.log_struct(log_entry, severity="WARNING")
-        print(f"[GCPGuard] Finding logged: category={category}, severity={severity}, resource={resource_name}")
 
+# HANDLER 1: Public Bucket Remediation
+
+def handle_public_bucket(finding_info):
+    """
+    Removes public access (allUsers, allAuthenticatedUsers) from a Cloud Storage bucket.
+    
+    Categories handled:
+    - PUBLIC_BUCKET_ACL
+    - PUBLIC_BUCKET_IAM
+    - BUCKET_POLICY_ONLY_DISABLED
+    """
+    try:
+        resource_name = finding_info.get("resourceName", "")
+        
+        # Extract bucket name from resource_name
+        # Format: //storage.googleapis.com/projects/_/buckets/BUCKET_NAME
+        if "/buckets/" not in resource_name:
+            return {"status": "error", "message": "Invalid bucket resource name"}
+        
+        bucket_name = resource_name.split("/buckets/")[-1]
+        
+        print(f"[GCP GUARD] Remediating public bucket: {bucket_name}")
+        
+        # Get bucket and its IAM policy
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        
+        try:
+            policy = bucket.get_iam_policy(requested_policy_version=3)
+        except exceptions.NotFound:
+            return {"status": "error", "message": f"Bucket not found: {bucket_name}"}
+        
+        # Remove public members from all bindings
+        public_members = {"allUsers", "allAuthenticatedUsers"}
+        modified = False
+        new_bindings = []
+        
+        for binding in policy.bindings:
+            original_members = set(binding.get("members", []))
+            safe_members = original_members - public_members
+            
+            if original_members != safe_members:
+                print(f"[GCP GUARD] Removing public access from role: {binding.get('role')}")
+                modified = True
+            
+            if safe_members:  # Only keep binding if there are non-public members
+                binding["members"] = list(safe_members)
+                new_bindings.append(binding)
+        
+        if modified:
+            policy.bindings = new_bindings
+            bucket.set_iam_policy(policy)
+            print(f"[GCP GUARD] ✅ Removed public access from bucket: {bucket_name}")
+            return {
+                "status": "success",
+                "bucket": bucket_name,
+                "message": "Public access removed"
+            }
+        else:
+            print(f"[GCP GUARD] No public bindings found on bucket: {bucket_name}")
+            return {
+                "status": "no_action",
+                "bucket": bucket_name,
+                "message": "No public bindings to remove"
+            }
+            
     except Exception as e:
-        logger.log_text(f"[GCPGuard] Error processing finding: {str(e)}", severity="ERROR")
-        print(f"[GCPGuard] Error: {str(e)}")
-        raise e
+        print(f"[GCP GUARD] ❌ Failed to remediate public bucket: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {"status": "error", "message": str(e)}
+
+
+# HANDLER 2: Overly Permissive IAM
+
+def handle_overly_permissive_iam(finding_info):
+    """
+    Removes overly permissive IAM bindings (roles/owner, roles/editor) from
+    service accounts and external users.
+    
+    Categories handled:
+    - ADMIN_SERVICE_ACCOUNT
+    - KMS_ROLE_SEPARATION
+    """
+    try:
+        resource_name = finding_info.get("resourceName", "")
+        
+        # Extract project ID from resource_name
+        # Format: //cloudresourcemanager.googleapis.com/projects/PROJECT_ID
+        if "/projects/" not in resource_name:
+            return {"status": "error", "message": "Invalid project resource name"}
+        
+        project_id = resource_name.split("/projects/")[-1]
+        
+        print(f"[GCP GUARD] Remediating overly permissive IAM on project: {project_id}")
+        
+        # Use Resource Manager API
+        credentials, _ = google.auth.default()
+        client = resourcemanager_v3.ProjectsClient(credentials=credentials)
+        
+        # Get current IAM policy
+        request = resourcemanager_v3.GetIamPolicyRequest(
+            resource=f"projects/{project_id}"
+        )
+        policy = client.get_iam_policy(request=request)
+        
+        print(f"[GCP GUARD] DEBUG: Total bindings found: {len(policy.bindings)}")
+        
+        # Roles to remove from service accounts
+        dangerous_roles = {"roles/owner", "roles/editor"}
+        modified = False
+        new_bindings = []
+        
+        for binding in policy.bindings:
+            print(f"[GCP GUARD] DEBUG: Checking binding role: {binding.role}")
+            
+            if binding.role not in dangerous_roles:
+                new_bindings.append(binding)
+                continue
+            
+            print(f"[GCP GUARD] DEBUG: Found dangerous role: {binding.role}")
+            print(f"[GCP GUARD] DEBUG: Members: {binding.members}")
+            
+            # Keep only non-service-account members for these roles
+            original_members = list(binding.members)
+            safe_members = [
+                m for m in original_members
+                if not m.startswith("serviceAccount:")
+            ]
+            
+            print(f"[GCP GUARD] DEBUG: Original members count: {len(original_members)}")
+            print(f"[GCP GUARD] DEBUG: Safe members count: {len(safe_members)}")
+            
+            if len(safe_members) < len(original_members):
+                removed = set(original_members) - set(safe_members)
+                print(f"[GCP GUARD] Removing {binding.role} from: {removed}")
+                modified = True
+            
+            # Only keep the binding if there are safe members left
+            if safe_members:
+                binding.members[:] = safe_members
+                new_bindings.append(binding)
+        
+        if modified:
+            # Replace bindings with cleaned list
+            policy.bindings[:] = new_bindings
+            
+            # Set the updated policy
+            set_request = resourcemanager_v3.SetIamPolicyRequest(
+                resource=f"projects/{project_id}",
+                policy=policy
+            )
+            client.set_iam_policy(request=set_request)
+            
+            print(f"[GCP GUARD] ✅ Removed overly permissive IAM bindings from: {project_id}")
+            return {
+                "status": "success",
+                "project": project_id,
+                "message": "Overly permissive IAM bindings removed"
+            }
+        else:
+            print(f"[GCP GUARD] No overly permissive bindings found on: {project_id}")
+            return {
+                "status": "no_action",
+                "project": project_id,
+                "message": "No overly permissive bindings to remove"
+            }
+            
+    except Exception as e:
+        print(f"[GCP GUARD] ❌ Failed to remediate IAM: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {"status": "error", "message": str(e)}
+
+# HANDLER 3: Open Firewall Rules
+
+def handle_open_firewall(finding_info):
+    """
+    Disables firewall rules that allow unrestricted access (0.0.0.0/0) on
+    sensitive ports like SSH (22) and RDP (3389).
+    
+    Categories handled:
+    - OPEN_FIREWALL
+    - FIREWALL_OPEN_TO_WORLD
+    - OPEN_SSH_PORT
+    - OPEN_RDP_PORT
+    """
+    try:
+        resource_name = finding_info.get("resourceName", "")
+        
+        # Extract project and firewall name from resource_name
+        # Format: //compute.googleapis.com/projects/PROJECT/global/firewalls/RULE_NAME
+        if "/firewalls/" not in resource_name:
+            return {"status": "error", "message": "Invalid firewall resource name"}
+        
+        parts = resource_name.split("/")
+        project_id = parts[parts.index("projects") + 1]
+        firewall_name = parts[-1]
+        
+        print(f"[GCP GUARD] Disabling open firewall rule: {firewall_name} in {project_id}")
+        
+        # Use Compute Engine API
+        firewalls_client = compute_v1.FirewallsClient()
+        
+        # Get the firewall rule
+        firewall = firewalls_client.get(project=project_id, firewall=firewall_name)
+        
+        # Check if it's actually open to 0.0.0.0/0
+        source_ranges = firewall.source_ranges
+        if "0.0.0.0/0" not in source_ranges:
+            print(f"[GCP GUARD] Firewall {firewall_name} does not allow 0.0.0.0/0, skipping")
+            return {
+                "status": "no_action",
+                "firewall": firewall_name,
+                "message": "Rule does not allow 0.0.0.0/0"
+            }
+        
+        # Disable the firewall rule (safer than deleting)
+        firewall.disabled = True
+        
+        patch_request = compute_v1.PatchFirewallRequest(
+            project=project_id,
+            firewall=firewall_name,
+            firewall_resource=firewall
+        )
+
+        operation = firewalls_client.patch(request=patch_request)
+        
+        print(f"[GCP GUARD] ✅ Disabled open firewall rule: {firewall_name}")
+        return {
+            "status": "success",
+            "firewall": firewall_name,
+            "project": project_id,
+            "message": "Firewall rule disabled"
+        }
+        
+    except Exception as e:
+        print(f"[GCP GUARD] ❌ Failed to remediate firewall: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {"status": "error", "message": str(e)}
+
+
+# HANDLER 4: Unencrypted Disks
+
+def handle_unencrypted_disk(finding_info):
+    """
+    Logs unencrypted disk findings for manual remediation.
+    
+    Automated disk encryption requires creating snapshots, new encrypted disks,
+    and instance downtime. Flagged for manual review instead.
+    
+    Categories handled:
+    - DISK_CMEK_DISABLED
+    """
+    try:
+        resource_name = finding_info.get("resourceName", "")
+        
+        print(f"[GCP GUARD] ⚠️ Unencrypted disk detected: {resource_name}")
+        print(f"[GCP GUARD] Manual remediation required: Create snapshot, then encrypted disk")
+        
+        return {
+            "status": "manual_action_required",
+            "resource": resource_name,
+            "message": "Disk encryption requires manual intervention"
+        }
+        
+    except Exception as e:
+        print(f"[GCP GUARD] ❌ Failed to process unencrypted disk: {str(e)}")
+        return {"status": "error", "message": str(e)}
+
+
+# HANDLER 5: Public IP Exposure
+
+def handle_public_ip(finding_info):
+    """
+    Removes external IP addresses from Compute Engine instances.
+    
+    Categories handled:
+    - PUBLIC_IP_ADDRESS
+    """
+    try:
+        resource_name = finding_info.get("resourceName", "")
+        
+        # Extract project, zone, and instance name from resource_name
+        # Format: //compute.googleapis.com/projects/PROJECT/zones/ZONE/instances/INSTANCE
+        if "/instances/" not in resource_name:
+            return {"status": "error", "message": "Invalid instance resource name"}
+        
+        parts = resource_name.split("/")
+        project_id = parts[parts.index("projects") + 1]
+        zone = parts[parts.index("zones") + 1]
+        instance_name = parts[-1]
+        
+        print(f"[GCP GUARD] Removing public IP from instance: {instance_name} in {zone}")
+        
+        # Use Compute Engine API
+        instances_client = compute_v1.InstancesClient()
+        
+        # Delete the access config
+        delete_request = compute_v1.DeleteAccessConfigInstanceRequest(
+            project=project_id,
+            zone=zone,
+            instance=instance_name,
+            access_config="external-nat",  # CHANGED TO LOWERCASE
+            network_interface="nic0"
+        )
+        
+        operation = instances_client.delete_access_config(request=delete_request)
+        operation.result()  # Wait for completion
+        
+        print(f"[GCP GUARD] ✅ Removed external IP from instance: {instance_name}")
+        return {
+            "status": "success",
+            "instance": instance_name,
+            "zone": zone,
+            "message": "External IP removed"
+        }
+        
+    except Exception as e:
+        print(f"[GCP GUARD] ❌ Failed to remove public IP: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {"status": "error", "message": str(e)}
