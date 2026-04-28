@@ -1,4 +1,4 @@
-PROJECT_ID="gcpguard-project1"
+PROJECT_ID="gcpguard-project12"
 REGION="us-central1"
 FUNCTION_NAME="gcpguard-remediate"
 PUBSUB_TOPIC="gcpguard-findings"
@@ -11,14 +11,14 @@ gcloud functions deploy $FUNCTION_NAME \
   --runtime=python311 \
   --region=$REGION \
   --source=. \
-  --entry-point=remediate \
+  --entry-point=process_security_finding \
   --trigger-topic=$PUBSUB_TOPIC \
   --service-account=$SA_EMAIL \
-  --memory=256Mi \
-  --timeout=120s \
+  --memory=512MB \
+  --timeout=540s \
   --project=$PROJECT_ID
 
 echo "✅ Deployment complete!"
 echo ""
 echo "To view logs run:"
-echo "gcloud functions logs read $FUNCTION_NAME --region=$REGION --project=$PROJECT_ID"
+echo "gcloud functions logs read $FUNCTION_NAME --gen2 --region=$REGION --project=$PROJECT_ID"
