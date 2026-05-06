@@ -5,7 +5,7 @@ from datetime import datetime
 
 from google.cloud import storage
 from google.cloud import compute_v1
-from google.cloud import resourcemanager_v3
+from google.cloud import resourcemanager
 import google.auth
 from google.api_core import exceptions
 
@@ -189,7 +189,7 @@ def handle_public_bucket(finding_info):
         return {"status": "error", "message": str(e)}
 
 
-# HANDLER 2: Overly Permissive IAM
+# HANDLER 2: Overly Permissive IAM - Using v1 API
 
 def handle_overly_permissive_iam(finding_info):
     """
@@ -212,69 +212,68 @@ def handle_overly_permissive_iam(finding_info):
         
         print(f"[GCP GUARD] Remediating overly permissive IAM on project: {project_id}")
         
-        # Use Resource Manager API
-        credentials, _ = google.auth.default()
-        client = resourcemanager_v3.ProjectsClient(credentials=credentials)
+        # SWITCHED TO v1 API - much simpler!
+        from google.cloud import resourcemanager
+        
+        client = resourcemanager.Client()
+        project = client.fetch_project(project_id)
         
         # Get current IAM policy
-        request = resourcemanager_v3.GetIamPolicyRequest(
-            resource=f"projects/{project_id}"
-        )
-        policy = client.get_iam_policy(request=request)
+        policy = project.get_iam_policy()
         
-        print(f"[GCP GUARD] DEBUG: Total bindings found: {len(policy.bindings)}")
+        print(f"[GCP GUARD] DEBUG: Current policy has {len(policy.bindings)} role bindings")
         
         # Roles to remove from service accounts
         dangerous_roles = {"roles/owner", "roles/editor"}
         modified = False
-        new_bindings = []
+        removed_members = []
         
-        for binding in policy.bindings:
-            print(f"[GCP GUARD] DEBUG: Checking binding role: {binding.role}")
-            
-            if binding.role not in dangerous_roles:
-                new_bindings.append(binding)
+        # Iterate through each role in the policy
+        for role in list(policy.bindings.keys()):
+            if role not in dangerous_roles:
                 continue
             
-            print(f"[GCP GUARD] DEBUG: Found dangerous role: {binding.role}")
-            print(f"[GCP GUARD] DEBUG: Members: {binding.members}")
+            print(f"[GCP GUARD] DEBUG: Found dangerous role: {role}")
             
-            # Keep only non-service-account members for these roles
-            original_members = list(binding.members)
-            safe_members = [
-                m for m in original_members
+            # Get current members for this role
+            current_members = set(policy.bindings[role])
+            print(f"[GCP GUARD] DEBUG: Current members: {current_members}")
+            
+            # Filter out service accounts
+            safe_members = {
+                m for m in current_members
                 if not m.startswith("serviceAccount:")
-            ]
+            }
             
-            print(f"[GCP GUARD] DEBUG: Original members count: {len(original_members)}")
-            print(f"[GCP GUARD] DEBUG: Safe members count: {len(safe_members)}")
+            # Check if we need to remove any
+            members_to_remove = current_members - safe_members
             
-            if len(safe_members) < len(original_members):
-                removed = set(original_members) - set(safe_members)
-                print(f"[GCP GUARD] Removing {binding.role} from: {removed}")
+            if members_to_remove:
+                print(f"[GCP GUARD] Removing {role} from: {members_to_remove}")
+                removed_members.extend(members_to_remove)
                 modified = True
-            
-            # Only keep the binding if there are safe members left
-            if safe_members:
-                binding.members[:] = safe_members
-                new_bindings.append(binding)
+                
+                # Update the policy - set to safe members only
+                if safe_members:
+                    policy.bindings[role] = safe_members
+                else:
+                    # If no safe members left, remove the entire role binding
+                    del policy.bindings[role]
         
         if modified:
-            # Replace bindings with cleaned list
-            policy.bindings[:] = new_bindings
+            print(f"[GCP GUARD] DEBUG: Applying updated policy...")
             
-            # Set the updated policy
-            set_request = resourcemanager_v3.SetIamPolicyRequest(
-                resource=f"projects/{project_id}",
-                policy=policy
-            )
-            client.set_iam_policy(request=set_request)
+            # Apply the updated policy
+            project.set_iam_policy(policy)
             
             print(f"[GCP GUARD] ✅ Removed overly permissive IAM bindings from: {project_id}")
+            print(f"[GCP GUARD] Removed {len(removed_members)} service account binding(s)")
+            
             return {
                 "status": "success",
                 "project": project_id,
-                "message": "Overly permissive IAM bindings removed"
+                "removed_count": len(removed_members),
+                "message": f"Removed {len(removed_members)} overly permissive IAM binding(s)"
             }
         else:
             print(f"[GCP GUARD] No overly permissive bindings found on: {project_id}")
@@ -420,7 +419,7 @@ def handle_public_ip(finding_info):
             project=project_id,
             zone=zone,
             instance=instance_name,
-            access_config="external-nat",  # CHANGED TO LOWERCASE
+            access_config="external-nat",
             network_interface="nic0"
         )
         
