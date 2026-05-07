@@ -6,6 +6,8 @@ from datetime import datetime
 from google.cloud import storage
 from google.cloud import compute_v1
 from google.cloud import resourcemanager
+from google.cloud import bigquery
+import time
 import google.auth
 from google.api_core import exceptions
 
@@ -114,6 +116,35 @@ def route_to_handler(finding_info):
             "category": category,
             "message": f"No remediation handler for {category}"
         }
+
+# BIGQUERY LOGGING HELPER
+
+def log_to_bigquery(category, handler_name, resource_name, status, message, execution_time):
+    """
+    Logs remediation events to BigQuery for analytics.
+    """
+    try:
+        client = bigquery.Client()
+        table_id = "gcpguard-project12.gcpguard_logs.remediation_events"
+        
+        rows_to_insert = [{
+            "timestamp": datetime.utcnow().isoformat(),
+            "category": category,
+            "handler": handler_name,
+            "resource_name": resource_name,
+            "status": status,
+            "message": message,
+            "execution_time": execution_time
+        }]
+        
+        errors = client.insert_rows_json(table_id, rows_to_insert)
+        if errors:
+            print(f"[BIGQUERY] Insert errors: {errors}")
+        else:
+            print(f"[BIGQUERY] ✅ Logged to BigQuery: {handler_name} - {status}")
+            
+    except Exception as e:
+        print(f"[BIGQUERY] ⚠️ Failed to log (non-critical): {str(e)}")
 
 
 # HANDLER 1: Public Bucket Remediation
