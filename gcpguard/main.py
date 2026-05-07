@@ -158,6 +158,9 @@ def handle_public_bucket(finding_info):
     - PUBLIC_BUCKET_IAM
     - BUCKET_POLICY_ONLY_DISABLED
     """
+    start_time = time.time()
+    category = finding_info.get("category", "UNKNOWN")
+    
     try:
         resource_name = finding_info.get("resourceName", "")
         
@@ -177,6 +180,7 @@ def handle_public_bucket(finding_info):
         try:
             policy = bucket.get_iam_policy(requested_policy_version=3)
         except exceptions.NotFound:
+            log_to_bigquery(category, "handler_1_public_bucket", bucket_name, "error", "Bucket not found", time.time() - start_time)
             return {"status": "error", "message": f"Bucket not found: {bucket_name}"}
         
         # Remove public members from all bindings
@@ -200,6 +204,9 @@ def handle_public_bucket(finding_info):
             policy.bindings = new_bindings
             bucket.set_iam_policy(policy)
             print(f"[GCP GUARD] ✅ Removed public access from bucket: {bucket_name}")
+            
+            log_to_bigquery(category, "handler_1_public_bucket", bucket_name, "success", "Public access removed", time.time() - start_time)
+            
             return {
                 "status": "success",
                 "bucket": bucket_name,
@@ -207,6 +214,9 @@ def handle_public_bucket(finding_info):
             }
         else:
             print(f"[GCP GUARD] No public bindings found on bucket: {bucket_name}")
+            
+            log_to_bigquery(category, "handler_1_public_bucket", bucket_name, "no_action", "No public bindings to remove", time.time() - start_time)
+            
             return {
                 "status": "no_action",
                 "bucket": bucket_name,
@@ -217,6 +227,9 @@ def handle_public_bucket(finding_info):
         print(f"[GCP GUARD] ❌ Failed to remediate public bucket: {str(e)}")
         import traceback
         traceback.print_exc()
+        
+        log_to_bigquery(category, "handler_1_public_bucket", resource_name, "error", str(e), time.time() - start_time)
+        
         return {"status": "error", "message": str(e)}
 
 
@@ -231,6 +244,9 @@ def handle_overly_permissive_iam(finding_info):
     - ADMIN_SERVICE_ACCOUNT
     - KMS_ROLE_SEPARATION
     """
+    start_time = time.time()
+    category = finding_info.get("category", "UNKNOWN")
+    
     try:
         resource_name = finding_info.get("resourceName", "")
         
@@ -300,6 +316,8 @@ def handle_overly_permissive_iam(finding_info):
             print(f"[GCP GUARD] ✅ Removed overly permissive IAM bindings from: {project_id}")
             print(f"[GCP GUARD] Removed {len(removed_members)} service account binding(s)")
             
+            log_to_bigquery(category, "handler_2_overly_permissive_iam", project_id, "success", f"Removed {len(removed_members)} overly permissive IAM binding(s)", time.time() - start_time)
+            
             return {
                 "status": "success",
                 "project": project_id,
@@ -308,6 +326,9 @@ def handle_overly_permissive_iam(finding_info):
             }
         else:
             print(f"[GCP GUARD] No overly permissive bindings found on: {project_id}")
+            
+            log_to_bigquery(category, "handler_2_overly_permissive_iam", project_id, "no_action", "No overly permissive bindings to remove", time.time() - start_time)
+            
             return {
                 "status": "no_action",
                 "project": project_id,
@@ -318,6 +339,9 @@ def handle_overly_permissive_iam(finding_info):
         print(f"[GCP GUARD] ❌ Failed to remediate IAM: {str(e)}")
         import traceback
         traceback.print_exc()
+        
+        log_to_bigquery(category, "handler_2_overly_permissive_iam", resource_name, "error", str(e), time.time() - start_time)
+        
         return {"status": "error", "message": str(e)}
 
 # HANDLER 3: Open Firewall Rules
@@ -333,6 +357,9 @@ def handle_open_firewall(finding_info):
     - OPEN_SSH_PORT
     - OPEN_RDP_PORT
     """
+    start_time = time.time()
+    category = finding_info.get("category", "UNKNOWN")
+    
     try:
         resource_name = finding_info.get("resourceName", "")
         
@@ -357,6 +384,9 @@ def handle_open_firewall(finding_info):
         source_ranges = firewall.source_ranges
         if "0.0.0.0/0" not in source_ranges:
             print(f"[GCP GUARD] Firewall {firewall_name} does not allow 0.0.0.0/0, skipping")
+            
+            log_to_bigquery(category, "handler_3_open_firewall", firewall_name, "no_action", "Rule does not allow 0.0.0.0/0", time.time() - start_time)
+            
             return {
                 "status": "no_action",
                 "firewall": firewall_name,
@@ -375,6 +405,9 @@ def handle_open_firewall(finding_info):
         operation = firewalls_client.patch(request=patch_request)
         
         print(f"[GCP GUARD] ✅ Disabled open firewall rule: {firewall_name}")
+        
+        log_to_bigquery(category, "handler_3_open_firewall", firewall_name, "success", "Firewall rule disabled", time.time() - start_time)
+        
         return {
             "status": "success",
             "firewall": firewall_name,
@@ -386,6 +419,9 @@ def handle_open_firewall(finding_info):
         print(f"[GCP GUARD] ❌ Failed to remediate firewall: {str(e)}")
         import traceback
         traceback.print_exc()
+        
+        log_to_bigquery(category, "handler_3_open_firewall", resource_name, "error", str(e), time.time() - start_time)
+        
         return {"status": "error", "message": str(e)}
 
 
@@ -401,11 +437,16 @@ def handle_unencrypted_disk(finding_info):
     Categories handled:
     - DISK_CMEK_DISABLED
     """
+    start_time = time.time()
+    category = finding_info.get("category", "UNKNOWN")
+    
     try:
         resource_name = finding_info.get("resourceName", "")
         
         print(f"[GCP GUARD] ⚠️ Unencrypted disk detected: {resource_name}")
         print(f"[GCP GUARD] Manual remediation required: Create snapshot, then encrypted disk")
+        
+        log_to_bigquery(category, "handler_4_unencrypted_disk", resource_name, "manual_action_required", "Disk encryption requires manual intervention", time.time() - start_time)
         
         return {
             "status": "manual_action_required",
@@ -415,6 +456,9 @@ def handle_unencrypted_disk(finding_info):
         
     except Exception as e:
         print(f"[GCP GUARD] ❌ Failed to process unencrypted disk: {str(e)}")
+        
+        log_to_bigquery(category, "handler_4_unencrypted_disk", resource_name, "error", str(e), time.time() - start_time)
+        
         return {"status": "error", "message": str(e)}
 
 
@@ -427,6 +471,9 @@ def handle_public_ip(finding_info):
     Categories handled:
     - PUBLIC_IP_ADDRESS
     """
+    start_time = time.time()
+    category = finding_info.get("category", "UNKNOWN")
+    
     try:
         resource_name = finding_info.get("resourceName", "")
         
@@ -458,6 +505,9 @@ def handle_public_ip(finding_info):
         operation.result()  # Wait for completion
         
         print(f"[GCP GUARD] ✅ Removed external IP from instance: {instance_name}")
+        
+        log_to_bigquery(category, "handler_5_public_ip", instance_name, "success", "External IP removed", time.time() - start_time)
+        
         return {
             "status": "success",
             "instance": instance_name,
@@ -469,4 +519,7 @@ def handle_public_ip(finding_info):
         print(f"[GCP GUARD] ❌ Failed to remove public IP: {str(e)}")
         import traceback
         traceback.print_exc()
+        
+        log_to_bigquery(category, "handler_5_public_ip", resource_name, "error", str(e), time.time() - start_time)
+        
         return {"status": "error", "message": str(e)}
